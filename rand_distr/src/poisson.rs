@@ -9,7 +9,7 @@
 
 //! The Poisson distribution `Poisson(λ)`.
 
-use crate::{Cauchy, Distribution, Standard};
+use crate::{Distribution, Exp1, Normal, Standard, StandardNormal};
 use core::fmt;
 use num_traits::{Float, FloatConst};
 use rand::Rng;
@@ -178,49 +178,98 @@ impl<F> Distribution<F> for RejectionMethod<F>
 where
     F: Float + FloatConst,
     Standard: Distribution<F>,
+    StandardNormal: Distribution<F>,
+    Exp1: Distribution<F>,
 {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> F {
-        // The algorithm from Numerical Recipes in C
+        let omega = F::one() / (F::from(2).unwrap() * F::PI()).sqrt() / self.lambda.sqrt();
+        let s = self.lambda.sqrt();
+        let d = F::from(6).unwrap() * self.lambda.powi(2);
+        let big_l = (self.lambda - F::from(1.1484).unwrap()).floor();
+        let b1 = F::from(1.0 / 24.0).unwrap() / self.lambda;
+        let b2 = F::from(0.3).unwrap() * b1 * b1;
+        let c3 = F::from(1.0 / 7.0).unwrap() * b1 * b2;
+        let c2 = b2 - F::from(15).unwrap() * c3;
+        let c1 = b1 - F::from(6).unwrap() * b2 + F::from(45).unwrap() * c3;
+        let c0 = F::one() - b1 + F::from(3).unwrap() * b2 - F::from(15).unwrap() * c3;
+        let c = F::from(0.1069).unwrap() / self.lambda;
 
-        // we use the Cauchy distribution as the comparison distribution
-        // f(x) ~ 1/(1+x^2)
-        let cauchy = Cauchy::new(F::zero(), F::one()).unwrap();
-        let mut result;
+        const FACT: [f64; 10] = [
+            1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0,
+        ]; // table of k! for k = 0,1,...,9
+        const A: [f64; 8] = [
+            -0.5, 0.3333333, -0.2500068, 0.2000118, -0.1661269, 0.1421878, -0.1384794, 0.1250060,
+        ]; // coefficients for rational approximation
 
-        loop {
-            let mut comp_dev;
+        let f = |k: F| {
+            let (px, py) = if k < F::from(10).unwrap() {
+                let px = -self.lambda;
+                let py = self.lambda.powf(k) / F::from(FACT[k.to_usize().unwrap()]).unwrap();
 
-            loop {
-                // draw from the Cauchy distribution
-                comp_dev = rng.sample(cauchy);
-                // shift the peak of the comparison distribution
-                result = self.sqrt_2lambda * comp_dev + self.lambda;
-                // repeat the drawing until we are in the range of possible values
-                if result >= F::zero() {
-                    break;
-                }
+                (px, py)
+            } else {
+                let delta = (F::from(12).unwrap() * k).recip();
+                let delta = delta - F::from(4.8).unwrap() * delta.powi(3);
+                let v = (self.lambda - k) / k;
+
+                let px = if v.abs() <= F::from(0.25).unwrap() {
+                    k * v.powi(2)
+                        * A.iter()
+                            .rev()
+                            .fold(F::zero(), |acc, &a| {    
+                                acc * v + F::from(a).unwrap()
+                            }) // Σ a_i * v^i
+                        - delta
+                } else {
+                    k * (F::one() + v).ln() - (self.lambda - k) - delta
+                };
+
+                let py = F::one() / (F::from(2).unwrap() * F::PI()).sqrt() / k.sqrt();
+
+                (px, py)
+            };
+
+            let x = (k - self.lambda + F::from(0.5).unwrap()) / s;
+            let fx = -F::from(0.5).unwrap() * x * x;
+            let fy = omega * (((c3 * x * x + c2) * x * x + c1) * x * x + c0);
+
+            (px, py, fx, fy)
+        };
+
+        let normal = Normal::new(self.lambda, s).unwrap();
+
+        let g = normal.sample(rng);
+        if g >= F::zero() {
+            let k = g.floor();
+
+            if k >= big_l {
+                return k;
             }
-            // now the result is a random variable greater than 0 with Cauchy distribution
-            // the result should be an integer value
-            result = result.floor();
 
-            // this is the ratio of the Poisson distribution to the comparison distribution
-            // the magic value scales the distribution function to a range of approximately 0-1
-            // since it is not exact, we multiply the ratio by 0.9 to avoid ratios greater than 1
-            // this doesn't change the resulting distribution, only increases the rate of failed drawings
-            let check = F::from(0.9).unwrap()
-                * (F::one() + comp_dev * comp_dev)
-                * (result * self.log_lambda
-                    - crate::utils::log_gamma(F::one() + result)
-                    - self.magic_val)
-                    .exp();
+            let u = rng.random::<F>();
+            if d * u >= (self.lambda - k).powi(3) {
+                return k;
+            }
 
-            // check with uniform random value - if below the threshold, we are within the target distribution
-            if rng.random::<F>() <= check {
-                break;
+            let (px, py, fx, fy) = f(k);
+
+            if fy * (F::one() - u) <= py * (px - fx).exp() {
+                return k;
             }
         }
-        result
+
+        loop {
+            let e = Exp1.sample(rng);
+            let u: F = rng.random() * F::from(2).unwrap() - F::one();
+            let t = F::from(1.8).unwrap() + e * u.signum();
+            if t > F::from(-0.6744).unwrap() {
+                let k = (self.lambda + s * t).floor();
+                let (px, py, fx, fy) = f(k);
+                if c * u.abs() <= py * (px + e).exp() - fy * (fx + e).exp() {
+                    return k;
+                }
+            }
+        }
     }
 }
 
@@ -228,6 +277,8 @@ impl<F> Distribution<F> for Poisson<F>
 where
     F: Float + FloatConst,
     Standard: Distribution<F>,
+    StandardNormal: Distribution<F>,
+    Exp1: Distribution<F>,
 {
     #[inline]
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> F {
@@ -253,6 +304,8 @@ mod test {
     fn test_poisson_avg_gen<F: Float + FloatConst>(lambda: F, tol: F)
     where
         Standard: Distribution<F>,
+        StandardNormal: Distribution<F>,
+        Exp1: Distribution<F>,
     {
         let poisson = Poisson::new(lambda).unwrap();
         let mut rng = crate::test::rng(123);
